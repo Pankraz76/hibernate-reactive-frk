@@ -21,6 +21,7 @@ import org.hibernate.dialect.lock.spi.RowLockStrategy;
 import org.hibernate.engine.config.spi.ConfigurationService;
 import org.hibernate.engine.config.spi.StandardConverters;
 import org.hibernate.engine.jdbc.env.spi.JdbcEnvironment;
+import org.hibernate.engine.spi.SharedSessionContractImplementor;
 import org.hibernate.id.IdentifierGenerator;
 import org.hibernate.id.enhanced.SequenceStyleGenerator;
 import org.hibernate.id.enhanced.TableGenerator;
@@ -28,13 +29,17 @@ import org.hibernate.id.enhanced.TableStructure;
 import org.hibernate.jdbc.TooManyRowsAffectedException;
 import org.hibernate.metamodel.spi.RuntimeModelCreationContext;
 import org.hibernate.reactive.pool.ReactiveConnection;
+import org.hibernate.reactive.pool.ReactiveConnectionPool;
 import org.hibernate.reactive.provider.Settings;
 import org.hibernate.reactive.session.ReactiveConnectionSupplier;
+import org.hibernate.reactive.util.internal.CompletionStages;
 import org.hibernate.service.ServiceRegistry;
 
 
 import static org.hibernate.reactive.util.internal.CompletionStages.completedFuture;
 import static org.hibernate.reactive.util.internal.CompletionStages.failedFuture;
+import static org.hibernate.reactive.util.internal.CompletionStages.nullFuture;
+import static org.hibernate.reactive.util.internal.CompletionStages.supplyStage;
 
 /**
  * Support for JPA's {@link jakarta.persistence.TableGenerator}.
@@ -43,6 +48,9 @@ import static org.hibernate.reactive.util.internal.CompletionStages.failedFuture
  * <p>
  * This implementation supports block allocation, but does not
  * guarantee that generated identifiers are sequential.
+ * <p>
+ * Like in Hibernate ORM, the table is updated with a dedicated connection,
+ * in a transaction that is independent of the transaction of the session.
  */
 public class TableReactiveIdentifierGenerator extends BlockingIdentifierGenerator implements IdentifierGenerator {
 
@@ -60,10 +68,13 @@ public class TableReactiveIdentifierGenerator extends BlockingIdentifierGenerato
 	private final String insertQuery;
 	private final String updateQuery;
 
+	private final ReactiveConnectionPool connectionPool;
+
 	public TableReactiveIdentifierGenerator(
 			TableGenerator generator,
 			RuntimeModelCreationContext runtimeModelCreationContext) {
 		ServiceRegistry serviceRegistry = runtimeModelCreationContext.getServiceRegistry();
+		connectionPool = serviceRegistry.getService( ReactiveConnectionPool.class );
 		segmentColumnName = generator.getSegmentColumnName();
 		valueColumnName = generator.getValueColumnName();
 		segmentValue = generator.getSegmentValue();
@@ -83,6 +94,7 @@ public class TableReactiveIdentifierGenerator extends BlockingIdentifierGenerato
 			SequenceStyleGenerator generator,
 			RuntimeModelCreationContext runtimeModelCreationContext) {
 		ServiceRegistry serviceRegistry = runtimeModelCreationContext.getServiceRegistry();
+		connectionPool = serviceRegistry.getService( ReactiveConnectionPool.class );
 		JdbcEnvironment jdbcEnvironment = serviceRegistry.getService( JdbcEnvironment.class );
 		Dialect dialect = jdbcEnvironment.getDialect();
 		TableStructure structure = (TableStructure) generator.getDatabaseStructure();
@@ -106,21 +118,66 @@ public class TableReactiveIdentifierGenerator extends BlockingIdentifierGenerato
 	}
 
 	/**
-	 * The row of the table is locked until the end of the transaction of the session
-	 * that requested the new block, so each session has to request its own.
+	 * Each caller requests its own block, as it did when the request used the transaction
+	 * of the session and locked the row of the table until the end of that transaction.
 	 */
 	@Override
 	protected boolean isNextHiValueShared() {
 		return false;
 	}
 
+	/**
+	 * Request a new block with a dedicated connection, in a separate transaction: if the
+	 * transaction of the session rolls back, the update of the table must not roll back
+	 * with it, because the ids of the block might have been used by other sessions.
+	 */
 	@Override
 	protected CompletionStage<Long> nextHiValue(ReactiveConnectionSupplier session) {
+		final String tenantId = session instanceof SharedSessionContractImplementor contract
+				? contract.getTenantIdentifier()
+				: null;
+		return supplyStage( () -> tenantId == null
+						? connectionPool.getConnection()
+						: connectionPool.getConnection( tenantId ) )
+				.thenCompose( connection -> nextHiValue( connection )
+						.handle( CompletionStages::<Long, Throwable>handle )
+						.thenCompose( handler -> connection.close()
+								.thenCompose( handler::getResultAsCompletionStage ) ) );
+	}
+
+	private CompletionStage<Long> nextHiValue(ReactiveConnection connection) {
+		return nextHiValueInNewTransaction( connection )
+				// someone else grabbed the next hi value, so retry everything from scratch
+				.thenCompose( id -> id == null ? nextHiValue( connection ) : completedFuture( id ) );
+	}
+
+	private CompletionStage<Long> nextHiValueInNewTransaction(ReactiveConnection connection) {
+		return connection.beginTransaction()
+				.thenCompose( v -> updateHiValue( connection ) )
+				.handle( CompletionStages::<Long, Throwable>handle )
+				.thenCompose( handler -> handler.hasFailed()
+						? rollback( connection, handler.getThrowable() )
+						: connection.commitTransaction().thenCompose( handler::getResultAsCompletionStage ) );
+	}
+
+	private static CompletionStage<Long> rollback(ReactiveConnection connection, Throwable failure) {
+		return connection.rollbackTransaction()
+				.handle( (v, rollbackFailure) -> {
+					if ( rollbackFailure != null ) {
+						failure.addSuppressed( rollbackFailure );
+					}
+					return null;
+				} )
+				.thenCompose( v -> failedFuture( failure ) );
+	}
+
+	/**
+	 * @return the next hi value, or {@code null} if someone else updated the table concurrently
+	 */
+	private CompletionStage<Long> updateHiValue(ReactiveConnection connection) {
 		// We need to read the current hi value from the table
 		// and update it by the specified increment, but we
-		// need to do it atomically, and without depending on
-		// transaction rollback.
-		final ReactiveConnection connection = session.getReactiveConnection();
+		// need to do it atomically.
 		// 1) select the current hi value
 		return connection
 				.selectIdentifier( selectQuery, selectParameters(), Long.class )
@@ -151,16 +208,16 @@ public class TableReactiveIdentifierGenerator extends BlockingIdentifierGenerato
 					}
 					return connection.update( sql, params )
 							// 3) check the updated row count to detect simultaneous update
-							.thenCompose( rowCount -> checkValue( session, rowCount, id ) );
+							.thenCompose( rowCount -> checkValue( rowCount, id ) );
 				} );
 	}
 
-	private CompletionStage<Long> checkValue(ReactiveConnectionSupplier session, Integer rowCount, long id) {
+	private static CompletionStage<Long> checkValue(Integer rowCount, long id) {
 		return switch ( rowCount ) {
 			// we successfully obtained the next hi value
 			case 1 -> completedFuture( id );
-			// someone else grabbed the next hi value, so retry everything from scratch
-			case 0 -> nextHiValue( session );
+			// someone else grabbed the next hi value
+			case 0 -> nullFuture();
 			// Something is wrong
 			default -> failedFuture( new TooManyRowsAffectedException( "multiple rows in id table", 1, rowCount ) );
 		};
